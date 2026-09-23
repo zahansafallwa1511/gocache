@@ -227,42 +227,107 @@ func (s *Store) Add(ctx context.Context, key string, value []byte, ttl time.Dura
 	return nil
 }
 
-// Increment implements [cache.Store] inside a transaction, taking a row lock
-// where the dialect supports one, so concurrent writers cannot lose an update.
-func (s *Store) Increment(ctx context.Context, key string, delta int64) (int64, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, fmt.Errorf("cache/sql: begin: %w", err)
-	}
-	defer tx.Rollback()
+// maxIncrementRetries bounds the compare-and-swap loop in Increment. Each
+// retry means another writer won the race; exceeding this many in a row implies
+// contention far beyond what a cache counter should see.
+const maxIncrementRetries = 100
 
-	query := fmt.Sprintf(`SELECT value, expires_at FROM %s WHERE cache_key = ? AND `+live, s.table)
-	if s.dialect != SQLite {
-		query += ` FOR UPDATE`
+// Increment implements [cache.Store].
+//
+// It uses compare-and-swap rather than a row lock, because a lock cannot be
+// taken on a row that does not exist yet: with SELECT ... FOR UPDATE, every
+// caller incrementing a brand-new counter reads "absent" at once and they
+// overwrite each other. Instead each attempt writes only if the value it read
+// is still there — an insert that must not collide, or an update guarded by the
+// previous value — and retries when another writer got there first.
+func (s *Store) Increment(ctx context.Context, key string, delta int64) (int64, error) {
+	insert := s.rebind(fmt.Sprintf(
+		`INSERT INTO %s (cache_key, value, expires_at) VALUES (?, ?, ?)`, s.table))
+	swap := s.rebind(fmt.Sprintf(
+		`UPDATE %s SET value = ? WHERE cache_key = ? AND value = ?`, s.table))
+
+	for range maxIncrementRetries {
+		current, raw, err := s.readCounter(ctx, key)
+		if err != nil {
+			return 0, err
+		}
+		next := current + delta
+
+		if raw == nil {
+			// No live row: claim the key. A duplicate key means somebody else
+			// claimed it first, so read again and retry.
+			if _, err := s.db.ExecContext(ctx, insert, key, cache.FormatCounter(next), expiresAt(cache.Forever)); err == nil {
+				return next, nil
+			}
+			// The row may exist but be expired, in which case the insert above
+			// can never succeed; overwrite it if it is still expired.
+			replaced, err := s.replaceExpired(ctx, key, cache.FormatCounter(next))
+			if err != nil {
+				return 0, err
+			}
+			if replaced {
+				return next, nil
+			}
+			continue
+		}
+
+		res, err := s.db.ExecContext(ctx, swap, cache.FormatCounter(next), key, raw)
+		if err != nil {
+			return 0, fmt.Errorf("cache/sql: increment: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("cache/sql: increment: %w", err)
+		}
+		if n == 1 {
+			// The swap leaves expires_at untouched, so an existing counter
+			// keeps the deadline it already had.
+			return next, nil
+		}
 	}
+	return 0, fmt.Errorf("cache/sql: increment %q: gave up after %d contended attempts", key, maxIncrementRetries)
+}
+
+// readCounter returns the live counter at key: its value and the exact bytes
+// stored, which the compare-and-swap uses as its guard. A missing or expired
+// entry reads as zero with nil bytes.
+func (s *Store) readCounter(ctx context.Context, key string) (int64, []byte, error) {
+	query := s.rebind(fmt.Sprintf(`SELECT value, expires_at FROM %s WHERE cache_key = ? AND `+live, s.table))
 
 	var (
 		raw     []byte
 		expires int64
-		current int64
 	)
-	switch err := tx.QueryRowContext(ctx, s.rebind(query), key, time.Now().UnixMilli()).Scan(&raw, &expires); {
-	case err == nil:
-		if current, err = cache.ParseCounter(raw); err != nil {
-			return 0, err
-		}
-	case !errors.Is(err, databasesql.ErrNoRows):
-		return 0, fmt.Errorf("cache/sql: increment: %w", err)
+	switch err := s.db.QueryRowContext(ctx, query, key, time.Now().UnixMilli()).Scan(&raw, &expires); {
+	case errors.Is(err, databasesql.ErrNoRows):
+		return 0, nil, nil
+	case err != nil:
+		return 0, nil, fmt.Errorf("cache/sql: increment: %w", err)
 	}
 
-	current += delta
-	if err := s.upsert(ctx, txDB{tx}, key, cache.FormatCounter(current), expires); err != nil {
-		return 0, err
+	n, err := cache.ParseCounter(raw)
+	if err != nil {
+		return 0, nil, err
 	}
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("cache/sql: commit: %w", err)
+	return n, raw, nil
+}
+
+// replaceExpired overwrites a row only while it is still expired, reporting
+// whether it did. It is how a counter reclaims a key whose old entry timed out.
+func (s *Store) replaceExpired(ctx context.Context, key string, value []byte) (bool, error) {
+	query := s.rebind(fmt.Sprintf(
+		`UPDATE %s SET value = ?, expires_at = 0 WHERE cache_key = ? AND expires_at <> 0 AND expires_at <= ?`,
+		s.table))
+
+	res, err := s.db.ExecContext(ctx, query, value, key, time.Now().UnixMilli())
+	if err != nil {
+		return false, fmt.Errorf("cache/sql: increment: %w", err)
 	}
-	return current, nil
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("cache/sql: increment: %w", err)
+	}
+	return n == 1, nil
 }
 
 // Forget implements [cache.Store].

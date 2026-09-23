@@ -98,13 +98,12 @@ func (s *Store) read(key string) ([]byte, time.Time, error) {
 	return data[headerSize:], expiresAt, nil
 }
 
-// write stores value atomically: the bytes go to a temporary file in the same
-// directory, which is then renamed over the target. A reader therefore sees
-// either the old entry or the new one, never a half-written file.
-func (s *Store) write(key string, value []byte, expiresAt time.Time) error {
-	path := s.path(key)
+// writeTemp writes a complete entry to a fresh temporary file beside its final
+// path and returns that file's name. The caller decides how to publish it:
+// rename to overwrite, or link to claim the name only if it is free.
+func (s *Store) writeTemp(path string, value []byte, expiresAt time.Time) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("cache/file: create bucket: %w", err)
+		return "", fmt.Errorf("cache/file: create bucket: %w", err)
 	}
 
 	buf := make([]byte, headerSize+len(value))
@@ -115,22 +114,37 @@ func (s *Store) write(key string, value []byte, expiresAt time.Time) error {
 
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
 	if err != nil {
-		return fmt.Errorf("cache/file: create temp: %w", err)
+		return "", fmt.Errorf("cache/file: create temp: %w", err)
 	}
-	defer os.Remove(tmp.Name())
-
 	if _, err := tmp.Write(buf); err != nil {
 		tmp.Close()
-		return fmt.Errorf("cache/file: write: %w", err)
+		os.Remove(tmp.Name())
+		return "", fmt.Errorf("cache/file: write: %w", err)
 	}
 	if err := tmp.Chmod(s.perm); err != nil {
 		tmp.Close()
-		return fmt.Errorf("cache/file: chmod: %w", err)
+		os.Remove(tmp.Name())
+		return "", fmt.Errorf("cache/file: chmod: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("cache/file: close: %w", err)
+		os.Remove(tmp.Name())
+		return "", fmt.Errorf("cache/file: close: %w", err)
 	}
-	if err := os.Rename(tmp.Name(), path); err != nil {
+	return tmp.Name(), nil
+}
+
+// write stores value atomically: the bytes go to a temporary file in the same
+// directory, which is then renamed over the target. A reader therefore sees
+// either the old entry or the new one, never a half-written file.
+func (s *Store) write(key string, value []byte, expiresAt time.Time) error {
+	path := s.path(key)
+	tmp, err := s.writeTemp(path, value, expiresAt)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp)
+
+	if err := os.Rename(tmp, path); err != nil {
 		return fmt.Errorf("cache/file: rename: %w", err)
 	}
 	return nil
@@ -158,33 +172,46 @@ func (s *Store) Put(ctx context.Context, key string, value []byte, ttl time.Dura
 	return s.write(key, value, expiry(ttl))
 }
 
-// Add implements [cache.Store]. The check and the write are guarded by an
-// exclusive file creation, so it is atomic across processes and usable as the
-// basis for locking.
+// addAttempts bounds the retry loop in Add. Each retry means another process
+// replaced an expired entry a moment before we did.
+const addAttempts = 3
+
+// Add implements [cache.Store].
+//
+// The entry is written to a temporary file and published with link, which fails
+// if the name is already taken. That is what makes the check and the write one
+// atomic step across processes — creating the file first and writing afterwards
+// would leave a window in which a second caller also believes it won.
 func (s *Store) Add(ctx context.Context, key string, value []byte, ttl time.Duration) error {
 	if ttl < 0 {
 		return cache.ErrNotStored
 	}
 
 	path := s.path(key)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("cache/file: create bucket: %w", err)
+	tmp, err := s.writeTemp(path, value, expiry(ttl))
+	if err != nil {
+		return err
 	}
+	defer os.Remove(tmp)
 
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, s.perm)
-	if errors.Is(err, fs.ErrExist) {
+	for range addAttempts {
+		switch err := os.Link(tmp, path); {
+		case err == nil:
+			return nil
+		case !errors.Is(err, fs.ErrExist):
+			return fmt.Errorf("cache/file: link: %w", err)
+		}
 
+		// The name is taken. If what is there is live, the key belongs to
+		// somebody else; if it has expired, read has already removed it and the
+		// next attempt can claim the name.
 		if _, _, err := s.read(key); err == nil {
 			return cache.ErrNotStored
+		} else if !errors.Is(err, cache.ErrNotFound) {
+			return err
 		}
-		return s.write(key, value, expiry(ttl))
 	}
-	if err != nil {
-		return fmt.Errorf("cache/file: create: %w", err)
-	}
-	f.Close()
-	_ = os.Remove(path)
-	return s.write(key, value, expiry(ttl))
+	return cache.ErrNotStored
 }
 
 // Increment implements [cache.Store]. The read-modify-write is guarded by a

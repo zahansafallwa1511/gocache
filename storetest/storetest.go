@@ -22,6 +22,8 @@ package storetest
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -136,6 +138,67 @@ func Run(t *testing.T, newStore Factory) {
 		}
 		if string(got) != "7" {
 			t.Fatalf("counter stored as %q, want %q — drivers must use cache.FormatCounter", got, "7")
+		}
+	})
+
+	t.Run("ConcurrentIncrement", func(t *testing.T) {
+		// A counter created under contention is where a read-modify-write
+		// implementation loses updates: every writer sees "absent" at once.
+		s := newStore(t)
+
+		const workers = 50
+		var wg sync.WaitGroup
+		for range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if _, err := s.Increment(context.Background(), "hits", 1); err != nil {
+					t.Errorf("Increment: %v", err)
+				}
+			}()
+		}
+		wg.Wait()
+
+		value, err := s.Get(t.Context(), "hits")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		n, err := cache.ParseCounter(value)
+		if err != nil {
+			t.Fatalf("ParseCounter: %v", err)
+		}
+		if n != workers {
+			t.Fatalf("counter = %d after %d concurrent increments, want %d", n, workers, workers)
+		}
+	})
+
+	t.Run("ConcurrentAddElectsOneWinner", func(t *testing.T) {
+		// Add is the primitive locks are built on, so exactly one caller must
+		// win a contested key.
+		s := newStore(t)
+
+		const workers = 50
+		var (
+			wg      sync.WaitGroup
+			winners atomic.Int64
+		)
+		for range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				switch err := s.Add(context.Background(), "once", []byte("v"), time.Minute); {
+				case err == nil:
+					winners.Add(1)
+				case errors.Is(err, cache.ErrNotStored):
+				default:
+					t.Errorf("Add: %v", err)
+				}
+			}()
+		}
+		wg.Wait()
+
+		if n := winners.Load(); n != 1 {
+			t.Fatalf("%d callers believed they stored the key, want exactly 1", n)
 		}
 	})
 

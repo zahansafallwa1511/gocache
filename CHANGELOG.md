@@ -6,6 +6,27 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-24
+
+### Fixed
+
+- **`sql`: concurrent increments lost updates.** `Increment` took a row lock,
+  but a lock cannot be taken on a row that does not exist yet, so every caller
+  incrementing a brand-new counter read "absent" at once and overwrote the
+  others. 25 concurrent increments could leave the counter at 1. It now uses
+  compare-and-swap with retries.
+- **`file`: two callers could both win `Add`.** The old implementation created
+  the file exclusively, removed it, then wrote — and a second caller could claim
+  the name inside that gap, which also made locks non-exclusive. The entry is
+  now written to a temporary file and published with `link`, which fails if the
+  name is taken.
+
+### Added
+
+- The conformance suite now covers concurrent `Increment` and contested `Add`,
+  so every driver — including third-party ones — is held to these guarantees.
+  Both bugs above were found by these cases.
+
 ## [0.2.0] - 2026-09-24
 
 ### Added
@@ -39,6 +60,7 @@ All notable changes to this project are documented here. The format follows
 - Drivers: `memory`, `file`, `redis`, `sql` and `null`.
 - `storetest`, a conformance suite third-party drivers can run.
 
-[Unreleased]: https://github.com/zahansafallwa1511/gocache/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/zahansafallwa1511/gocache/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/zahansafallwa1511/gocache/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/zahansafallwa1511/gocache/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/zahansafallwa1511/gocache/releases/tag/v0.1.0
