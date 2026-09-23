@@ -5,7 +5,7 @@ go 1.25
 require (
 	github.com/go-sql-driver/mysql v1.10.1
 	github.com/lib/pq v1.12.3
-	github.com/zahansafallwa1511/gocache v0.1.0
+	github.com/zahansafallwa1511/gocache v0.2.0
 	modernc.org/sqlite v1.37.0
 )
 
