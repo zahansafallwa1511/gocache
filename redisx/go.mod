@@ -4,7 +4,7 @@ go 1.25
 
 require (
 	github.com/redis/go-redis/v9 v9.7.3
-	github.com/zahansafallwa1511/gocache v0.2.0
+	github.com/zahansafallwa1511/gocache v0.2.1
 )
 
 require (
