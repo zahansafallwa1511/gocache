@@ -33,6 +33,7 @@ Redis or SQL client.
 | `gocache/memory` | Sharded maps, lazy expiry, background janitor. |
 | `gocache/file` | Atomic writes via rename; safe across processes. |
 | `gocache/redis` | Client-agnostic — see below. |
+| `gocache/redisx` | Ready-made `go-redis` adapter. Separate module, so only its users take the dependency. |
 | `gocache/sql` | Postgres, MySQL, SQLite via `database/sql`. |
 | `gocache/null` | Caches nothing. Turn caching off without touching call sites. |
 
@@ -176,7 +177,24 @@ see in a constructor.
 
 ## Redis
 
-The Redis driver depends on no client. It needs one method:
+The quickest path, if you already use `go-redis`:
+
+```sh
+go get github.com/zahansafallwa1511/gocache/redisx
+```
+
+```go
+client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+c := cache.New(redisx.New(client))
+```
+
+`redisx` lives in its own module, so importing `gocache` itself never pulls in
+`go-redis`. It accepts any `redis.UniversalClient` — a plain client, a cluster,
+a ring, or a failover client.
+
+### Any other client
+
+The `redis` driver itself depends on no client at all. It needs one method:
 
 ```go
 type Conn interface {
@@ -184,17 +202,8 @@ type Conn interface {
 }
 ```
 
-With `github.com/redis/go-redis/v9`:
-
-```go
-type conn struct{ c *redis.Client }
-
-func (c conn) Do(ctx context.Context, args ...any) (any, error) {
-    return c.c.Do(ctx, args...).Result()
-}
-
-store := redisstore.New(conn{client})
-```
+Implement it over rueidis, redigo, or anything else, and the driver works
+unchanged. `redisx` above is exactly this adapter for `go-redis`, nothing more.
 
 `Flush` issues `FLUSHDB`, so give the cache its own database.
 
@@ -224,6 +233,19 @@ func TestStore(t *testing.T) {
 Implement `TTLStore`, `ManyStore` or `LockStore` as well and the suite picks up
 the extra cases automatically; `cache.Cache` detects them at runtime and falls
 back gracefully when they are absent.
+
+## Testing
+
+```sh
+go test ./...
+```
+
+The Redis integration tests need a server and are skipped without one:
+
+```sh
+docker run -d --rm -p 6399:6379 redis:7-alpine
+cd redisx && REDIS_ADDR=localhost:6399 go test ./...
+```
 
 ## License
 
