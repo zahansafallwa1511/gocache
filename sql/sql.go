@@ -1,3 +1,23 @@
+// Package sql provides a database-backed cache store.
+//
+// It uses only database/sql, so any driver works. Three dialects ship with it —
+// [Postgres], [MySQL] and [SQLite] — because they differ in placeholder syntax
+// and in how an upsert is spelled.
+//
+//	store := sql.New(db, sql.Postgres)
+//	if err := store.CreateTable(ctx); err != nil {
+//		return err
+//	}
+//	c := cache.New(store)
+//
+// Call [Store.CreateTable] once, or run the equivalent migration yourself, and
+// schedule [Store.DeleteExpired] to reclaim expired rows — this driver has no
+// janitor of its own.
+//
+// A database cache is slower than memory or Redis and competes with your
+// application for the same connection pool. It earns its place when you want
+// caching without operating another service, or when entries must survive a
+// restart and be shared across instances.
 package sql
 
 import (
@@ -11,6 +31,8 @@ import (
 	"github.com/zahansafallwa1511/gocache"
 )
 
+// Dialect names the SQL flavour of the target database. Dialects differ in
+// placeholder syntax and in how an upsert is spelled.
 type Dialect int
 
 const (
@@ -21,6 +43,8 @@ const (
 	SQLite
 )
 
+// DB is the subset of [database/sql.DB] the store uses. *sql.DB satisfies it,
+// as does any wrapper with the same shape.
 type DB interface {
 	ExecContext(ctx context.Context, query string, args ...any) (databasesql.Result, error)
 	QueryRowContext(ctx context.Context, query string, args ...any) *databasesql.Row
@@ -28,18 +52,29 @@ type DB interface {
 	BeginTx(ctx context.Context, opts *databasesql.TxOptions) (*databasesql.Tx, error)
 }
 
+// Store is a database-backed [cache.Store].
 type Store struct {
 	db      DB
 	dialect Dialect
 	table   string
 }
 
+// Option configures a [Store].
 type Option func(*Store)
 
+// WithTable sets the table name. The default is "cache". The name is
+// interpolated into statements rather than bound as a parameter, because SQL
+// does not allow a placeholder there — so pass a constant, never user input.
 func WithTable(name string) Option {
 	return func(s *Store) { s.table = name }
 }
 
+// New returns a store backed by db.
+//
+//	store := sql.New(db, sql.Postgres)
+//	if err := store.CreateTable(ctx); err != nil {
+//		return err
+//	}
 func New(db DB, dialect Dialect, opts ...Option) *Store {
 	s := &Store{db: db, dialect: dialect, table: "cache"}
 	for _, opt := range opts {
@@ -48,6 +83,8 @@ func New(db DB, dialect Dialect, opts ...Option) *Store {
 	return s
 }
 
+// rebind rewrites the ? placeholders of query into the dialect's own form.
+// Statements are written with ? throughout and translated here.
 func (s *Store) rebind(query string) string {
 	if s.dialect != Postgres {
 		return query
@@ -65,14 +102,20 @@ func (s *Store) rebind(query string) string {
 	return b.String()
 }
 
+// CreateTable creates the cache table and its index if they do not exist. It is
+// safe to call on every boot. Run it once at startup, or manage the schema with
+// your own migrations instead.
 func (s *Store) CreateTable(ctx context.Context) error {
 	var stmt string
 	switch s.dialect {
 	case MySQL:
+		// MySQL has no CREATE INDEX IF NOT EXISTS, so the index is declared
+		// inline where re-running the statement is harmless.
 		stmt = `CREATE TABLE IF NOT EXISTS %s (
 			cache_key VARCHAR(255) NOT NULL PRIMARY KEY,
 			value LONGBLOB NOT NULL,
-			expires_at BIGINT NOT NULL
+			expires_at BIGINT NOT NULL,
+			KEY cache_expires_at_idx (expires_at)
 		)`
 	case Postgres:
 		stmt = `CREATE TABLE IF NOT EXISTS %s (
@@ -90,6 +133,9 @@ func (s *Store) CreateTable(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(stmt, s.table)); err != nil {
 		return fmt.Errorf("cache/sql: create table: %w", err)
 	}
+	if s.dialect == MySQL {
+		return nil
+	}
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
 		`CREATE INDEX IF NOT EXISTS %s_expires_at_idx ON %s (expires_at)`, s.table, s.table)); err != nil {
 		return fmt.Errorf("cache/sql: create index: %w", err)
@@ -97,6 +143,7 @@ func (s *Store) CreateTable(ctx context.Context) error {
 	return nil
 }
 
+// expiresAt encodes a ttl as Unix milliseconds, with zero meaning no expiry.
 func expiresAt(ttl time.Duration) int64 {
 	if ttl == cache.Forever {
 		return 0
@@ -104,8 +151,10 @@ func expiresAt(ttl time.Duration) int64 {
 	return time.Now().Add(ttl).UnixMilli()
 }
 
+// live is the SQL predicate matching rows that have not expired.
 const live = `(expires_at = 0 OR expires_at > ?)`
 
+// Get implements [cache.Store].
 func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 	query := s.rebind(fmt.Sprintf(`SELECT value FROM %s WHERE cache_key = ? AND `+live, s.table))
 
@@ -120,6 +169,7 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 	return value, nil
 }
 
+// upsert writes a row, replacing any existing one, in the dialect's spelling.
 func (s *Store) upsert(ctx context.Context, db DB, key string, value []byte, expires int64) error {
 	var clause string
 	switch s.dialect {
@@ -137,6 +187,7 @@ func (s *Store) upsert(ctx context.Context, db DB, key string, value []byte, exp
 	return nil
 }
 
+// Put implements [cache.Store].
 func (s *Store) Put(ctx context.Context, key string, value []byte, ttl time.Duration) error {
 	if ttl < 0 {
 		return s.Forget(ctx, key)
@@ -144,6 +195,9 @@ func (s *Store) Put(ctx context.Context, key string, value []byte, ttl time.Dura
 	return s.upsert(ctx, s.db, key, value, expiresAt(ttl))
 }
 
+// Add implements [cache.Store]. It first tries a plain insert and, if the row
+// already exists, overwrites it only when the existing entry has expired — so
+// two racing callers can never both believe they stored the value.
 func (s *Store) Add(ctx context.Context, key string, value []byte, ttl time.Duration) error {
 	if ttl < 0 {
 		return cache.ErrNotStored
@@ -173,6 +227,8 @@ func (s *Store) Add(ctx context.Context, key string, value []byte, ttl time.Dura
 	return nil
 }
 
+// Increment implements [cache.Store] inside a transaction, taking a row lock
+// where the dialect supports one, so concurrent writers cannot lose an update.
 func (s *Store) Increment(ctx context.Context, key string, delta int64) (int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -209,6 +265,7 @@ func (s *Store) Increment(ctx context.Context, key string, delta int64) (int64, 
 	return current, nil
 }
 
+// Forget implements [cache.Store].
 func (s *Store) Forget(ctx context.Context, key string) error {
 	query := s.rebind(fmt.Sprintf(`DELETE FROM %s WHERE cache_key = ?`, s.table))
 	if _, err := s.db.ExecContext(ctx, query, key); err != nil {
@@ -217,6 +274,7 @@ func (s *Store) Forget(ctx context.Context, key string) error {
 	return nil
 }
 
+// Flush implements [cache.Store] by deleting every row in the table.
 func (s *Store) Flush(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`DELETE FROM %s`, s.table)); err != nil {
 		return fmt.Errorf("cache/sql: flush: %w", err)
@@ -224,6 +282,11 @@ func (s *Store) Flush(ctx context.Context) error {
 	return nil
 }
 
+// DeleteExpired removes expired rows and reports how many it deleted.
+//
+// Unlike the other drivers, a database cache has no janitor: expired rows are
+// invisible to reads but stay on disk until this runs. Call it from a scheduled
+// job, or the table grows without bound.
 func (s *Store) DeleteExpired(ctx context.Context) (int64, error) {
 	query := s.rebind(fmt.Sprintf(
 		`DELETE FROM %s WHERE expires_at <> 0 AND expires_at <= ?`, s.table))
@@ -234,6 +297,7 @@ func (s *Store) DeleteExpired(ctx context.Context) (int64, error) {
 	return res.RowsAffected()
 }
 
+// TTL implements [cache.TTLStore].
 func (s *Store) TTL(ctx context.Context, key string) (time.Duration, error) {
 	query := s.rebind(fmt.Sprintf(`SELECT expires_at FROM %s WHERE cache_key = ? AND `+live, s.table))
 
@@ -251,6 +315,7 @@ func (s *Store) TTL(ctx context.Context, key string) (time.Duration, error) {
 	return time.Until(time.UnixMilli(expires)), nil
 }
 
+// Many implements [cache.ManyStore] with a single IN query.
 func (s *Store) Many(ctx context.Context, keys []string) ([][]byte, error) {
 	if len(keys) == 0 {
 		return nil, nil
@@ -295,6 +360,7 @@ func (s *Store) Many(ctx context.Context, keys []string) ([][]byte, error) {
 	return values, nil
 }
 
+// PutMany implements [cache.ManyStore] in one transaction.
 func (s *Store) PutMany(ctx context.Context, values map[string][]byte, ttl time.Duration) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -314,6 +380,7 @@ func (s *Store) PutMany(ctx context.Context, values map[string][]byte, ttl time.
 	return nil
 }
 
+// Acquire implements [cache.LockStore] on top of the atomic Add.
 func (s *Store) Acquire(ctx context.Context, key, owner string, ttl time.Duration) (bool, error) {
 	switch err := s.Add(ctx, key, []byte(owner), ttl); {
 	case err == nil:
@@ -325,6 +392,7 @@ func (s *Store) Acquire(ctx context.Context, key, owner string, ttl time.Duratio
 	}
 }
 
+// Release implements [cache.LockStore] with an owner-checked delete.
 func (s *Store) Release(ctx context.Context, key, owner string) (bool, error) {
 	query := s.rebind(fmt.Sprintf(`DELETE FROM %s WHERE cache_key = ? AND value = ?`, s.table))
 	res, err := s.db.ExecContext(ctx, query, key, []byte(owner))
@@ -335,10 +403,13 @@ func (s *Store) Release(ctx context.Context, key, owner string) (bool, error) {
 	return n == 1, err
 }
 
+// ForceRelease implements [cache.LockStore].
 func (s *Store) ForceRelease(ctx context.Context, key string) error {
 	return s.Forget(ctx, key)
 }
 
+// txDB adapts a transaction to the DB interface, so statement builders are
+// shared between the transactional and non-transactional paths.
 type txDB struct{ tx *databasesql.Tx }
 
 func (t txDB) ExecContext(ctx context.Context, q string, args ...any) (databasesql.Result, error) {

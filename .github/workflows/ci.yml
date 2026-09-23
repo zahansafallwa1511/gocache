@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (Go ${{ matrix.go }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go: ['1.25']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Build
+        run: go build ./...
+      - name: Test
+        run: go test -race -count=1 ./...
+
+  integration:
+    name: Integration (Redis, Postgres, MySQL, SQLite)
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: cache
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s --health-timeout 3s --health-retries 10
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: cache
+          MYSQL_DATABASE: cache
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd "mysqladmin ping -uroot -pcache"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: Redis driver against a real server
+        working-directory: redisx
+        env:
+          REDIS_ADDR: localhost:6379
+        run: go test -race -count=1 ./...
+      - name: SQL driver against SQLite, Postgres and MySQL
+        working-directory: sqltest
+        env:
+          POSTGRES_DSN: postgres://postgres:cache@localhost:5432/postgres?sslmode=disable
+          MYSQL_DSN: root:cache@tcp(localhost:3306)/cache
+        run: go test -race -count=1 ./...
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+      - name: Tidy check
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod
+
+  dependency-free:
+    name: Core module has no dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: Assert an empty require block
+        run: |
+          if grep -q '^require' go.mod; then
+            echo "The core module gained a dependency:"
+            cat go.mod
+            exit 1
+          fi
+          echo "go.mod declares no requirements."

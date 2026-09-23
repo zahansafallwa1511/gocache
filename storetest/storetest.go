@@ -1,3 +1,22 @@
+// Package storetest provides a conformance suite for [cache.Store]
+// implementations.
+//
+// A driver — including one you write outside this module — proves it honours the
+// contract by calling [Run] with a factory:
+//
+//	func TestStore(t *testing.T) {
+//		storetest.Run(t, func(t *testing.T) cache.Store {
+//			return mystore.New()
+//		})
+//	}
+//
+// The suite covers the required behaviour of [cache.Store] and, when the store
+// implements them, the optional [cache.TTLStore], [cache.ManyStore] and
+// [cache.LockStore] interfaces. Cases for interfaces a store does not implement
+// are skipped, so the same call works for a minimal driver and a full one.
+//
+// Some cases sleep for tens of milliseconds to observe expiry, so the suite
+// takes a second or so per driver.
 package storetest
 
 import (
@@ -9,8 +28,14 @@ import (
 	"github.com/zahansafallwa1511/gocache"
 )
 
+// Factory builds a store for one subtest. It must return an empty store: the
+// suite assumes no key it did not write exists, so a factory for a shared
+// backend should flush it, or point each subtest at its own namespace.
 type Factory func(t *testing.T) cache.Store
 
+// Run exercises the [cache.Store] contract, plus the optional [cache.TTLStore],
+// [cache.ManyStore] and [cache.LockStore] interfaces when the store implements
+// them. Each case runs as a subtest, so a failure names the behaviour that broke.
 func Run(t *testing.T, newStore Factory) {
 	t.Helper()
 
@@ -218,6 +243,7 @@ func Run(t *testing.T, newStore Factory) {
 	})
 }
 
+// mustPut stores a value, failing the test if the store rejects it.
 func mustPut(t *testing.T, s cache.Store, key string, value []byte, ttl time.Duration) {
 	t.Helper()
 	if err := s.Put(context.Background(), key, value, ttl); err != nil {
@@ -225,6 +251,7 @@ func mustPut(t *testing.T, s cache.Store, key string, value []byte, ttl time.Dur
 	}
 }
 
+// mustAdd stores a value conditionally, failing the test if the store rejects it.
 func mustAdd(t *testing.T, s cache.Store, key string, value []byte, ttl time.Duration) {
 	t.Helper()
 	if err := s.Add(context.Background(), key, value, ttl); err != nil {

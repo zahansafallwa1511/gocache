@@ -1,5 +1,11 @@
 # gocache
 
+[![CI](https://github.com/zahansafallwa1511/gocache/actions/workflows/ci.yml/badge.svg)](https://github.com/zahansafallwa1511/gocache/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/zahansafallwa1511/gocache.svg)](https://pkg.go.dev/github.com/zahansafallwa1511/gocache)
+[![Go Report Card](https://goreportcard.com/badge/github.com/zahansafallwa1511/gocache)](https://goreportcard.com/report/github.com/zahansafallwa1511/gocache)
+[![Go 1.25+](https://img.shields.io/badge/go-1.25%2B-00ADD8)](https://go.dev/dl/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A caching library for Go that keeps the call site short without giving up the
 manners of a standard-library package: `context` first, errors returned, no
 globals, and **no third-party dependencies**.
@@ -28,14 +34,17 @@ Two layers, so that using the library and extending it are separate jobs:
 Drivers live in their own packages, so importing `gocache` never drags in a
 Redis or SQL client.
 
-| Package | Notes |
-|---|---|
-| `gocache/memory` | Sharded maps, lazy expiry, background janitor. |
-| `gocache/file` | Atomic writes via rename; safe across processes. |
-| `gocache/redis` | Client-agnostic — see below. |
-| `gocache/redisx` | Ready-made `go-redis` adapter. Separate module, so only its users take the dependency. |
-| `gocache/sql` | Postgres, MySQL, SQLite via `database/sql`. |
-| `gocache/null` | Caches nothing. Turn caching off without touching call sites. |
+| Package | Shared between processes | Survives restart | Use it when |
+|---|---|---|---|
+| `gocache/memory` | no | no | You want the fastest possible cache and each instance may hold its own copy. |
+| `gocache/file` | same machine only | yes | One machine, no extra service to run. |
+| `gocache/redis` | yes | yes | Several instances must agree. The usual production choice. |
+| `gocache/redisx` | yes | yes | As above, with the `go-redis` adapter already written. |
+| `gocache/sql` | yes | yes | You want a shared cache without operating another service. |
+| `gocache/null` | — | — | You want caching off without touching call sites. |
+
+All of them support the full API — tags, locks, batches, counters — so switching
+driver is a one-line change.
 
 ## Usage
 
@@ -192,6 +201,44 @@ c := cache.New(redisx.New(client))
 `go-redis`. It accepts any `redis.UniversalClient` — a plain client, a cluster,
 a ring, or a failover client.
 
+### Managed Redis: ElastiCache, MemoryDB, Valkey
+
+Anything that speaks the Redis protocol works, because the driver only issues
+ordinary commands. AWS ElastiCache (Redis or Valkey), MemoryDB, Azure Cache for
+Redis, GCP Memorystore and Upstash are all just a client configuration:
+
+```go
+client := redis.NewClient(&redis.Options{
+    Addr:      "my-cache.abc123.ng.0001.use1.cache.amazonaws.com:6379",
+    Username:  "default",              // ElastiCache RBAC
+    Password:  os.Getenv("REDIS_AUTH"),
+    TLSConfig: &tls.Config{},          // required when encryption in transit is on
+})
+c := cache.New(redisx.New(client))
+```
+
+**With cluster mode enabled**, use a cluster client and say so:
+
+```go
+client := redis.NewClusterClient(&redis.ClusterOptions{
+    Addrs:     []string{"clustercfg.my-cache.abc123.use1.cache.amazonaws.com:6379"},
+    TLSConfig: &tls.Config{},
+})
+c := cache.New(redisx.New(client, redisstore.WithClusterMode()))
+```
+
+A cluster refuses multi-key commands whose keys live on different shards, so
+`Many` reads key by key there instead of using `MGET`. The driver detects this
+from the first `CROSSSLOT` error even without the option — `WithClusterMode`
+only saves that one failed round trip. Two things to know on a cluster:
+
+- `Flush` reaches a single node. Invalidate with tags instead, or flush each
+  master through your client.
+- Locks and counters are single-key operations, so they behave normally.
+
+ElastiCache's **Memcached** engine is not supported — this library has no
+Memcached driver.
+
 ### Any other client
 
 The `redis` driver itself depends on no client at all. It needs one method:
@@ -234,18 +281,43 @@ Implement `TTLStore`, `ManyStore` or `LockStore` as well and the suite picks up
 the extra cases automatically; `cache.Cache` detects them at runtime and falls
 back gracefully when they are absent.
 
+## Performance
+
+Against the memory driver on an M-series laptop, one core:
+
+```
+BenchmarkStoreGet      93.9 ns/op      8 B/op    1 allocs/op   raw store read
+BenchmarkCacheGet     968.3 ns/op    384 B/op   10 allocs/op   + JSON decode
+BenchmarkCacheSet     340.4 ns/op    154 B/op    3 allocs/op
+BenchmarkRememberHit  805.4 ns/op    320 B/op    7 allocs/op
+BenchmarkTaggedGet   1229.0 ns/op    584 B/op   14 allocs/op   + one tag lookup
+```
+
+The store itself costs about 90ns; the rest is JSON. If a hot path needs more,
+supply a faster `Codec` — that is what the interface is for. Tags add a read per
+operation, so prefer a prefix when you do not need grouped invalidation.
+
+Run them with `go test -bench . ./memory/`.
+
 ## Testing
 
 ```sh
-go test ./...
+go test -race ./...
 ```
 
-The Redis integration tests need a server and are skipped without one:
+Everything runs with no servers. Integration tests against real backends are
+skipped unless you point them at one:
 
 ```sh
 docker run -d --rm -p 6399:6379 redis:7-alpine
 cd redisx && REDIS_ADDR=localhost:6399 go test ./...
+
+cd sqltest && go test ./...   # SQLite needs no server
 ```
+
+CI runs the full matrix — Linux, macOS and Windows, plus the conformance suite
+against real Redis, Postgres, MySQL and SQLite — on every push. See
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
