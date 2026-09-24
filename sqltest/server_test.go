@@ -1,6 +1,7 @@
 package sqltest_test
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -46,7 +47,7 @@ func runServerSuite(t *testing.T, db *sql.DB, dialect sqlstore.Dialect) {
 		if err := store.CreateTable(t.Context()); err != nil {
 			t.Fatalf("CreateTable: %v", err)
 		}
-		t.Cleanup(func() { db.Exec("DROP TABLE IF EXISTS " + table) })
+		t.Cleanup(func() { _, _ = db.ExecContext(context.Background(), "DROP TABLE IF EXISTS "+table) })
 		return store
 	})
 }
@@ -68,7 +69,7 @@ func TestPostgresConcurrentIncrement(t *testing.T) {
 	if err := store.CreateTable(t.Context()); err != nil {
 		t.Fatalf("CreateTable: %v", err)
 	}
-	t.Cleanup(func() { db.Exec("DROP TABLE IF EXISTS " + table) })
+	t.Cleanup(func() { _, _ = db.ExecContext(context.Background(), "DROP TABLE IF EXISTS "+table) })
 
 	const workers = 25
 	var wg sync.WaitGroup
@@ -105,7 +106,7 @@ func TestPostgresLockAcrossConnections(t *testing.T) {
 	if err := store.CreateTable(t.Context()); err != nil {
 		t.Fatalf("CreateTable: %v", err)
 	}
-	t.Cleanup(func() { db.Exec("DROP TABLE IF EXISTS " + table) })
+	t.Cleanup(func() { _, _ = db.ExecContext(context.Background(), "DROP TABLE IF EXISTS "+table) })
 
 	c := cache.New(store)
 	first, err := c.Lock("import", time.Minute)

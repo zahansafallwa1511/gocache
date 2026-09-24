@@ -35,11 +35,15 @@ import (
 // placeholder syntax and in how an upsert is spelled.
 type Dialect int
 
+// Supported SQL dialects.
 const (
+	// Postgres selects the PostgreSQL dialect ($1 placeholders, ON CONFLICT).
 	Postgres Dialect = iota
 
+	// MySQL selects the MySQL dialect (? placeholders, ON DUPLICATE KEY UPDATE).
 	MySQL
 
+	// SQLite selects the SQLite dialect (? placeholders, ON CONFLICT).
 	SQLite
 )
 
@@ -401,7 +405,7 @@ func (s *Store) Many(ctx context.Context, keys []string) ([][]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cache/sql: many: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	found := make(map[string][]byte, len(keys))
 	for rows.Next() {
@@ -431,7 +435,7 @@ func (s *Store) PutMany(ctx context.Context, values map[string][]byte, ttl time.
 	if err != nil {
 		return fmt.Errorf("cache/sql: begin: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	expires := expiresAt(ttl)
 	for k, v := range values {

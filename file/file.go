@@ -117,17 +117,17 @@ func (s *Store) writeTemp(path string, value []byte, expiresAt time.Time) (strin
 		return "", fmt.Errorf("cache/file: create temp: %w", err)
 	}
 	if _, err := tmp.Write(buf); err != nil {
-		tmp.Close()
-		os.Remove(tmp.Name())
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
 		return "", fmt.Errorf("cache/file: write: %w", err)
 	}
 	if err := tmp.Chmod(s.perm); err != nil {
-		tmp.Close()
-		os.Remove(tmp.Name())
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
 		return "", fmt.Errorf("cache/file: chmod: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmp.Name())
+		_ = os.Remove(tmp.Name())
 		return "", fmt.Errorf("cache/file: close: %w", err)
 	}
 	return tmp.Name(), nil
@@ -142,7 +142,7 @@ func (s *Store) write(key string, value []byte, expiresAt time.Time) error {
 	if err != nil {
 		return err
 	}
-	defer os.Remove(tmp)
+	defer func() { _ = os.Remove(tmp) }()
 
 	if err := os.Rename(tmp, path); err != nil {
 		return fmt.Errorf("cache/file: rename: %w", err)
@@ -192,7 +192,7 @@ func (s *Store) Add(ctx context.Context, key string, value []byte, ttl time.Dura
 	if err != nil {
 		return err
 	}
-	defer os.Remove(tmp)
+	defer func() { _ = os.Remove(tmp) }()
 
 	for range addAttempts {
 		switch err := os.Link(tmp, path); {
